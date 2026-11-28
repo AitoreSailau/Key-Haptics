@@ -5,8 +5,11 @@ A tiny macOS menu bar app that makes your MacBook trackpad vibrate while you typ
 - **Enter** – long, fading vibration
 - **Space** – a quick series of pulses (3 by default)
 - **Other keys** – optional light click
+- **Touching the trackpad** – a light click the moment a finger lands (ignored right after a key press, so resting palms don't buzz)
+- **Pinch-to-zoom** – a click every few percent of zoom (and on two-finger double-tap smart zoom)
+- **Switching tabs** – feedback on `⌘⇧[` `⌘⇧]`, `⌃Tab`, `⌃PgUp/PgDn`, `⌘⌥←/→`, `⌘1…⌘9` (browsers, Finder, Terminal, editors)
 - Keyboard backlight goes off instantly on Enter/Space and fades back in smoothly
-- Everything is configurable in **⌨︎ → Settings…** (effect, strength, pulse count, gap, fade length, backlight)
+- Everything is configurable in **⌨︎ → Settings…** (effect, strength, pulse count, gap, fade length, backlight, zoom step, per-feature on/off)
 
 > MacBooks have no vibrating keyboard – the feedback comes from the trackpad's Taptic Engine.
 
@@ -32,12 +35,13 @@ Needs Xcode Command Line Tools (`xcode-select --install`). Pushing a tag like `v
 
 - Key presses are observed with a listen-only `CGEventTap` (needs Input Monitoring). Nothing is logged or sent anywhere.
 - Haptics use the private `MultitouchSupport` framework, because the public `NSHapticFeedbackManager` only fires while a finger touches the trackpad. If the private call fails, the app falls back to the public API (the menu shows which mode is active).
+- Finger touches are detected through the same private `MultitouchSupport` framework (contact frames of the trackpad that owns the actuator). Pinch-to-zoom uses a global `NSEvent` monitor for magnify gestures. Tab switching is detected from the key shortcuts above, not from the app's actual tab state.
 - Backlight uses the private `CoreBrightness` `KeyboardBrightnessClient`. It can break on any macOS update, and it will not work if the backlight is off.
 - Private APIs mean this app can't be shipped on the App Store.
 
 ## По-русски
 
-Menu bar приложение для Mac: при печати трекпад вибрирует (Enter — длинная затухающая вибрация, пробел — серия быстрых), а подсветка клавиатуры на Enter/пробел мгновенно гаснет и плавно загорается. Всё настраивается в меню ⌨︎ → «Настройки…». Установка: скачай `KeyHaptics.zip` из Releases, открой правым кликом → «Открыть» и дай доступ Input Monitoring.
+Menu bar приложение для Mac: при печати трекпад вибрирует (Enter — длинная затухающая вибрация, пробел — серия быстрых), а подсветка клавиатуры на Enter/пробел мгновенно гаснет и плавно загорается. Также есть вибрация при касании трекпада, при зуме щипком и при переключении вкладок (⌘⇧[ ⌘⇧], ⌃Tab, ⌘1…9 и т. д.). Всё настраивается в меню ⌨︎ → «Настройки…». Установка: скачай `KeyHaptics.zip` из Releases, открой правым кликом → «Открыть» и дай доступ Input Monitoring.
 
 ## License
 

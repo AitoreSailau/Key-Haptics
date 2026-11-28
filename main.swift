@@ -50,11 +50,56 @@ let enterP = Profile(key: "enter", effect: .fade,   level: 4, count: 3, gapMs: 5
 let spaceP = Profile(key: "space", effect: .series, level: 3, count: 3, gapMs: 55, fadeMs: 500, light: true)
 let otherP = Profile(key: "other", effect: .single, level: 1, count: 1, gapMs: 55, fadeMs: 300, light: false)
 
+// Trackpad / system feedback
+let touchP = Profile(key: "touch", effect: .single, level: 1, count: 1, gapMs: 55, fadeMs: 300, light: false)  // finger touches the trackpad
+let zoomP  = Profile(key: "zoom",  effect: .single, level: 1, count: 1, gapMs: 55, fadeMs: 300, light: false)  // pinch-to-zoom ticks
+let tabP   = Profile(key: "tab",   effect: .single, level: 3, count: 2, gapMs: 55, fadeMs: 400, light: false)  // switching tabs
+
+/// A zoom tick is played every time the pinch changes the scale by this many percent
+var zoomStepPct: Int = UserDefaults.standard.object(forKey: "zoomStepPct") as? Int ?? 5 {
+    didSet { UserDefaults.standard.set(zoomStepPct, forKey: "zoomStepPct") }
+}
+/// Ignore touches right after a key press – they are almost always palms resting on the trackpad
+var touchIgnoreTyping: Bool = UserDefaults.standard.object(forKey: "touchIgnoreTyping") as? Bool ?? true {
+    didSet { UserDefaults.standard.set(touchIgnoreTyping, forKey: "touchIgnoreTyping") }
+}
+var lastKeyTime: TimeInterval = 0        // system uptime of the last key press
+var touchLastCount = 0                   // fingers on the trackpad in the previous frame
+var zoomAccum: CGFloat = 0               // accumulated pinch scale since the last zoom tick
+var lastTouchHaptic: TimeInterval = 0
+
 var lightFadeMs: Int = UserDefaults.standard.object(forKey: "lightFadeMs") as? Int ?? 700 {
     didSet { UserDefaults.standard.set(lightFadeMs, forKey: "lightFadeMs") }
 }
 var appEnabled: Bool = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true {
     didSet { UserDefaults.standard.set(appEnabled, forKey: "enabled") }
+}
+
+// MARK: - Finger touch detection (private MultitouchSupport contact frames)
+
+typealias MTContactCallback = @convention(c) (UnsafeRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
+
+/// Called by MultitouchSupport on its own thread for every frame of finger data.
+/// `data` is an array of MTTouch structs (96 bytes each); the touch state is a 32-bit int at offset 20:
+/// 0 not tracking, 1 start in range, 2 hover, 3 make touch, 4 touching, 5 break touch, 6 linger, 7 out of range.
+let touchCallback: MTContactCallback = { _, data, count, _, _ in
+    var touching = Int(max(count, 0))
+    if let data = data, count > 0 {
+        var contact = 0
+        var layoutOK = true
+        for i in 0..<Int(count) {
+            let state = data.load(fromByteOffset: i * 96 + 20, as: Int32.self)
+            if state < 0 || state > 7 { layoutOK = false; break }
+            if state == 3 || state == 4 { contact += 1 }
+        }
+        // If the struct layout ever changes, fall back to the plain finger count
+        if layoutOK { touching = contact }
+    }
+    if touching > 0 && touchLastCount == 0 {
+        DispatchQueue.main.async { handleTouchDown() }
+    }
+    touchLastCount = touching
+    return 0
 }
 
 // MARK: - Trackpad haptics (private MultitouchSupport + public fallback)
@@ -65,13 +110,17 @@ final class Haptics {
     private typealias CreateFn  = @convention(c) (UInt64) -> UnsafeMutableRawPointer?
     private typealias OpenFn    = @convention(c) (UnsafeMutableRawPointer) -> Int32
     private typealias ActuateFn = @convention(c) (UnsafeMutableRawPointer, Int32, UInt32, Float, Float) -> Int32
+    private typealias RegisterFn = @convention(c) (UnsafeRawPointer, MTContactCallback) -> Void
+    private typealias StartFn   = @convention(c) (UnsafeRawPointer, Int32) -> Void
 
     private var actuator: UnsafeMutableRawPointer?
     private var actuateFn: ActuateFn?
+    private var devices: CFArray?                    // keeps the device refs alive for the touch callback
     private let queue = DispatchQueue(label: "keyhaptics.haptics")
     private var gen = 0
     private static let ids: [Int32] = [3, 4, 5, 6]   // light ... strong
     var hasPrivateActuator: Bool { actuator != nil }
+    private(set) var hasTouchDetection = false
 
     init() {
         let path = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
@@ -89,6 +138,7 @@ final class Haptics {
 
         guard let rawArr = list() else { return }
         let arr = Unmanaged<CFArray>.fromOpaque(rawArr).takeRetainedValue()
+        devices = arr
 
         for i in 0..<CFArrayGetCount(arr) {
             guard let dev = CFArrayGetValueAtIndex(arr, i) else { continue }
@@ -97,9 +147,19 @@ final class Haptics {
             if open(act) == 0 {
                 actuator = act
                 actuateFn = unsafeBitCast(a, to: ActuateFn.self)
+                startTouchDetection(handle: h, device: dev)
                 break
             }
         }
+    }
+
+    /// Subscribes to finger frames of the same trackpad that owns the actuator
+    private func startTouchDetection(handle: UnsafeMutableRawPointer, device: UnsafeRawPointer) {
+        guard let r = dlsym(handle, "MTRegisterContactFrameCallback"),
+              let s = dlsym(handle, "MTDeviceStart") else { return }
+        unsafeBitCast(r, to: RegisterFn.self)(device, touchCallback)
+        unsafeBitCast(s, to: StartFn.self)(device, 0)
+        hasTouchDetection = true
     }
 
     func id(_ level: Int) -> Int32 { Haptics.ids[min(max(level, 1), 4) - 1] }
@@ -232,13 +292,65 @@ func trigger(_ p: Profile) {
     if p.light { backlight.flash(fadeMs: lightFadeMs) }
 }
 
+/// A finger has just touched the trackpad (main thread)
+func handleTouchDown() {
+    guard appEnabled, touchP.effect == .single else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    if touchIgnoreTyping, now - lastKeyTime < 0.5 { return }   // palm resting while typing
+    if now - lastTouchHaptic < 0.06 { return }                 // debounce flickering contacts
+    lastTouchHaptic = now
+    haptics.fireNow(haptics.id(touchP.level))
+}
+
+/// Pinch-to-zoom / smart zoom (main thread). Plays a click every `zoomStepPct` percent of scale change.
+func handleZoom(_ e: NSEvent) {
+    guard appEnabled, zoomP.effect == .single else { return }
+    if e.type == .smartMagnify {                               // two-finger double tap
+        haptics.fireNow(haptics.id(zoomP.level))
+        return
+    }
+    if e.phase.contains(.began) { zoomAccum = 0 }
+    zoomAccum += e.magnification
+    let step = CGFloat(max(zoomStepPct, 1)) / 100
+    if abs(zoomAccum) >= step {
+        zoomAccum = zoomAccum.truncatingRemainder(dividingBy: step)
+        haptics.fireNow(haptics.id(zoomP.level))
+    }
+}
+
+/// Browser / Finder / Terminal tab switching shortcuts (key codes are physical keys, so any layout works)
+func isTabSwitch(_ code: Int64, _ flags: CGEventFlags) -> Bool {
+    let cmd = flags.contains(.maskCommand), ctrl = flags.contains(.maskControl)
+    let alt = flags.contains(.maskAlternate), shift = flags.contains(.maskShift)
+    switch code {
+    case 48, 116, 121:                      // ⌃Tab, ⌃⇧Tab, ⌃PageUp, ⌃PageDown
+        return ctrl && !cmd && !alt
+    case 30, 33:                            // ⌘⇧]  ⌘⇧[
+        return cmd && shift && !ctrl && !alt
+    case 123, 124:                          // ⌘⌥←  ⌘⌥→
+        return cmd && alt && !ctrl && !shift
+    case 18, 19, 20, 21, 23, 22, 26, 28, 25: // ⌘1 … ⌘9
+        return cmd && !shift && !ctrl && !alt
+    default:
+        return false
+    }
+}
+
 let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     switch type {
     case .tapDisabledByTimeout, .tapDisabledByUserInput:
         if let t = tapRef { CGEvent.tapEnable(tap: t, enable: true) }
     case .keyDown:
-        guard appEnabled, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { break }
-        switch event.getIntegerValueField(.keyboardEventKeycode) {
+        lastKeyTime = ProcessInfo.processInfo.systemUptime
+        guard appEnabled else { break }
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
+        // Tab switching may repeat while the keys are held: every repeat really changes the tab
+        if (tabP.effect != .off || tabP.light) && isTabSwitch(code, event.flags) {
+            trigger(tabP)
+            break
+        }
+        guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { break }
+        switch code {
         case 36, 76: trigger(enterP)           // Return and keypad Enter
         case 49: trigger(spaceP)               // Space
         default:
@@ -331,7 +443,36 @@ final class SettingsWindow {
         return s
     }
 
-    private func section(_ title: String, _ p: Profile) -> NSView {
+    private func note(_ text: String) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.font = NSFont.systemFont(ofSize: 11)
+        l.textColor = .secondaryLabelColor
+        return l
+    }
+
+    /// Compact block: effect (off / single click), strength, test button + optional extra rows
+    private func simpleSection(_ title: String, _ p: Profile, note hint: String? = nil, extra: [NSView] = []) -> NSView {
+        let header = NSTextField(labelWithString: title)
+        header.font = NSFont.boldSystemFont(ofSize: 14)
+
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        popup.addItems(withTitles: ["Нет", "Одиночный клик"])
+        popup.selectItem(at: p.effect == .single ? 1 : 0)
+        bind(popup) { p.effect = popup.indexOfSelectedItem == 1 ? .single : .off }
+
+        let test = NSButton(title: "Проверить", target: nil, action: nil)
+        bind(test) { haptics.fireNow(haptics.id(p.level)) }
+
+        var rows: [NSView] = [header]
+        if let hint = hint { rows.append(note(hint)) }
+        rows.append(labelRow("Эффект", popup))
+        rows.append(labelRow("Сила", slider(1, 4, p.level, unit: " / 4", ticks: true) { p.level = $0 }))
+        rows.append(contentsOf: extra)
+        rows.append(test)
+        return vstack(rows)
+    }
+
+    private func section(_ title: String, _ p: Profile, note hint: String? = nil) -> NSView {
         let header = NSTextField(labelWithString: title)
         header.font = NSFont.boldSystemFont(ofSize: 14)
 
@@ -347,8 +488,9 @@ final class SettingsWindow {
         let test = NSButton(title: "Проверить", target: nil, action: nil)
         bind(test) { trigger(p) }
 
-        return vstack([
-            header,
+        var rows: [NSView] = [header]
+        if let hint = hint { rows.append(note(hint)) }
+        rows.append(contentsOf: [
             labelRow("Эффект", popup),
             labelRow("Сила", slider(1, 4, p.level, unit: " / 4", ticks: true) { p.level = $0 }),
             labelRow("Серия: число вибраций", slider(1, 8, p.count, unit: "", ticks: true) { p.count = $0 }),
@@ -357,40 +499,77 @@ final class SettingsWindow {
             cb,
             test
         ])
+        return vstack(rows)
+    }
+
+    /// One page of the tab view: the stack is pinned to the top-left corner of the page
+    private func page(_ views: [NSView]) -> (view: NSView, size: NSSize) {
+        let content = vstack(views)
+        content.edgeInsets = NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        let holder = NSView()
+        holder.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: holder.topAnchor),
+            content.leadingAnchor.constraint(equalTo: holder.leadingAnchor)
+        ])
+        return (holder, content.fittingSize)
     }
 
     private func build() {
-        let header = NSTextField(labelWithString: "Остальные клавиши")
-        header.font = NSFont.boldSystemFont(ofSize: 14)
-
-        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
-        popup.addItems(withTitles: ["Нет", "Одиночный клик"])
-        popup.selectItem(at: otherP.effect == .single ? 1 : 0)
-        bind(popup) { otherP.effect = popup.indexOfSelectedItem == 1 ? .single : .off }
-
-        let other = vstack([
-            header,
-            labelRow("Эффект", popup),
-            labelRow("Сила", slider(1, 4, otherP.level, unit: " / 4", ticks: true) { otherP.level = $0 })
+        // Tab 1: Enter and Space
+        let keys = page([
+            section("Enter", enterP), separator(),
+            section("Пробел", spaceP)
         ])
 
+        // Tab 2: all other keys + backlight timing
         let gh = NSTextField(labelWithString: "Подсветка")
         gh.font = NSFont.boldSystemFont(ofSize: 14)
-        let glob = vstack([
-            gh,
-            labelRow("Время плавного возврата", slider(100, 2000, lightFadeMs, unit: " мс") { lightFadeMs = $0 })
+        let others = page([
+            simpleSection("Остальные клавиши", otherP), separator(),
+            vstack([
+                gh,
+                labelRow("Время плавного возврата", slider(100, 2000, lightFadeMs, unit: " мс") { lightFadeMs = $0 })
+            ])
         ])
 
-        let root = vstack([
-            section("Enter", enterP), separator(),
-            section("Пробел", spaceP), separator(),
-            other, separator(),
-            glob
-        ])
-        root.edgeInsets = NSEdgeInsets(top: 16, left: 18, bottom: 16, right: 18)
+        // Tab 3: trackpad – touch and zoom
+        let ignoreTyping = NSButton(checkboxWithTitle: "Не вибрировать во время печати (ладони)", target: nil, action: nil)
+        ignoreTyping.state = touchIgnoreTyping ? .on : .off
+        bind(ignoreTyping) { touchIgnoreTyping = (ignoreTyping.state == .on) }
 
-        window.contentView = root
-        window.setContentSize(root.fittingSize)
+        let pad = page([
+            simpleSection("Касание трекпада", touchP,
+                          note: "Вибрация в момент, когда палец касается трекпада",
+                          extra: [ignoreTyping]),
+            separator(),
+            simpleSection("Зум", zoomP,
+                          note: "Щелчки при увеличении щипком (и двойном касании двумя пальцами)",
+                          extra: [labelRow("Щелчок каждые", slider(2, 20, zoomStepPct, unit: " %") { zoomStepPct = $0 })])
+        ])
+
+        // Tab 4: tab switching – full set of effects
+        let tabs = page([
+            section("Переключение вкладок", tabP,
+                    note: "⌘⇧[  ⌘⇧]  ·  ⌃Tab  ·  ⌃PgUp / ⌃PgDn  ·  ⌘⌥← / ⌘⌥→  ·  ⌘1…⌘9")
+        ])
+
+        let tabView = NSTabView()
+        let pages: [(String, (view: NSView, size: NSSize))] = [
+            ("Enter и пробел", keys), ("Клавиши", others), ("Трекпад", pad), ("Вкладки", tabs)
+        ]
+        for (title, p) in pages {
+            let item = NSTabViewItem(identifier: title)
+            item.label = title
+            item.view = p.view
+            tabView.addTabViewItem(item)
+        }
+
+        let w = pages.map { $0.1.size.width }.max() ?? 460
+        let h = pages.map { $0.1.size.height }.max() ?? 400
+        window.contentView = tabView
+        window.setContentSize(NSSize(width: w + 20, height: h + 52))   // room for the tab bar and its bezel
     }
 }
 
@@ -401,6 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var retryTimer: Timer?
     private var settings: SettingsWindow?
     private var enabledItem: NSMenuItem!
+    private var zoomMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem.button?.title = "⌨︎"
@@ -419,6 +599,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let info = [
             haptics.hasPrivateActuator ? "Вибрация: прямой доступ к трекпаду"
                                        : "Вибрация: fallback (только при касании трекпада)",
+            haptics.hasTouchDetection ? "Касание трекпада: определяется" : "Касание трекпада: недоступно",
             backlight.isAvailable ? "Подсветка: доступна" : "Подсветка: недоступна"
         ]
         for t in info {
@@ -430,6 +611,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
+
+        // Pinch-to-zoom events from every app (gesture events don't need Input Monitoring)
+        zoomMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.magnify, .smartMagnify]) { handleZoom($0) }
 
         startTap()
         if tapRef == nil {
